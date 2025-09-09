@@ -2,7 +2,7 @@
 import sys
 import numpy as np
 from matplotlib import pyplot as plt
-from scipy.ndimage import filters, measurements, interpolation, center_of_mass, shift
+from scipy.ndimage import center_of_mass, shift
 import glob
 from scipy.io import savemat
 import os
@@ -14,104 +14,101 @@ import argparse
 
 # Function for centering a kernel
 def kernel_shift(kernel, sf):
-    # First calculate the current center of mass for the kernel
     current_center_of_mass = center_of_mass(kernel)
-
-    # The idea kernel center
-    # for image blurred by filters.correlate
-    # wanted_center_of_mass = np.array(kernel.shape) / 2 + 0.5 * (sf - (kernel.shape[0] % 2))
-    # for image blurred by F.conv2d. They are the same after kernel.flip([0,1])
     wanted_center_of_mass = (np.array(kernel.shape) - sf) / 2.
-
-    # Define the shift vector for the kernel shifting (x,y)
     shift_vec = wanted_center_of_mass - current_center_of_mass
-
-    # Finally shift the kernel and return
     return shift(kernel, shift_vec)
 
 
-# Function for calculating the X4 kernel from the X2 kernel, used in KernelGAN
 def analytic_kernel(k):
     k_size = k.shape[0]
-    # Calculate the big kernels size
     big_k = np.zeros((3 * k_size - 2, 3 * k_size - 2))
-    # Loop over the small kernel to fill the big one
     for r in range(k_size):
         for c in range(k_size):
             big_k[2 * r:2 * r + k_size, 2 * c:2 * c + k_size] += k[r, c] * k
-    # Crop the edges of the big kernel to ignore very small values and increase run time of SR
     crop = k_size // 2
     cropped_big_k = big_k[crop:-crop, crop:-crop]
-    # Normalize to 1
     return cropped_big_k / cropped_big_k.sum()
 
 
-# Function for generating one fixed kernel
 def gen_kernel_fixed(k_size, scale_factor, lambda_1, lambda_2, theta, noise):
-    # Set COV matrix using Lambdas and Theta
-    LAMBDA = np.diag([lambda_1, lambda_2]);
+    LAMBDA = np.diag([lambda_1, lambda_2])
     Q = np.array([[np.cos(theta), -np.sin(theta)],
                   [np.sin(theta), np.cos(theta)]])
     SIGMA = Q @ LAMBDA @ Q.T
     INV_SIGMA = np.linalg.inv(SIGMA)[None, None, :, :]
 
-    # Set expectation position (shifting kernel for aligned image)
     MU = k_size // 2 + 0.5 * (scale_factor - k_size % 2)
     MU = MU[None, None, :, None]
 
-    # Create meshgrid for Gaussian
     [X, Y] = np.meshgrid(range(k_size[0]), range(k_size[1]))
     Z = np.stack([X, Y], 2)[:, :, :, None]
 
-    # Calcualte Gaussian for every pixel of the kernel
     ZZ = Z - MU
     ZZ_t = ZZ.transpose(0, 1, 3, 2)
     raw_kernel = np.exp(-0.5 * np.squeeze(ZZ_t @ INV_SIGMA @ ZZ)) * (1 + noise)
-
-    # shift the kernel so it will be centered
     raw_kernel_centered = kernel_shift(raw_kernel, scale_factor)
-
-    # Normalize the kernel and return
     kernel = raw_kernel_centered / np.sum(raw_kernel_centered)
-
     return kernel
 
 
-# Function for generating one random kernel
 def gen_kernel_random(k_size, scale_factor, min_var, max_var, noise_level):
-    lambda_1 = min_var + np.random.rand() * (max_var - min_var);
-    lambda_2 = min_var + np.random.rand() * (max_var - min_var);
+    lambda_1 = min_var + np.random.rand() * (max_var - min_var)
+    lambda_2 = min_var + np.random.rand() * (max_var - min_var)
     theta = np.random.rand() * np.pi
     noise = -noise_level + np.random.rand(*k_size) * noise_level * 2
-
     kernel = gen_kernel_fixed(k_size, scale_factor, lambda_1, lambda_2, theta, noise)
-
     return kernel
 
 
-# Function for degrading one image
 def degradation(input, kernel, scale_factor, noise_im, device=torch.device('cuda')):
-    # preprocess image and kernel
     input = torch.from_numpy(input).type(torch.FloatTensor).to(device).unsqueeze(0).permute(3, 0, 1, 2)
-    input = F.pad(input, pad=(kernel.shape[0] // 2, kernel.shape[0] // 2, kernel.shape[0] // 2, kernel.shape[0] // 2),
-                  mode='circular')
+    input = F.pad(input, pad=(kernel.shape[0] // 2, kernel.shape[0] // 2,
+                              kernel.shape[0] // 2, kernel.shape[0] // 2), mode='circular')
     kernel = torch.from_numpy(kernel).type(torch.FloatTensor).to(device).unsqueeze(0).unsqueeze(0)
 
-    # blur
     output = F.conv2d(input, kernel)
     output = output.permute(2, 3, 0, 1).squeeze(3).cpu().numpy()
-
-    # down-sample
     output = output[::scale_factor[0], ::scale_factor[1], :]
-
-    # add AWGN noise
     output += np.random.normal(0, np.random.uniform(0, noise_im), output.shape)
+    return output
 
+
+def degradation_regionwise(input, kernels, scale_factor, noise_im, grid_size=2, device=torch.device('cuda')):
+    """
+    Apply different kernels on different grid regions.
+    input: 原始图像 (H, W, C)
+    kernels: list of kernels, 数量应为 grid_size*grid_size
+    grid_size: 网格大小 (e.g. 2 -> 2x2 网格)
+    """
+    H, W, C = input.shape
+    h_step, w_step = H // grid_size, W // grid_size
+
+    outputs = []
+    for i in range(grid_size):
+        row_patches = []
+        for j in range(grid_size):
+            x0, x1 = j * w_step, (j + 1) * w_step if j < grid_size - 1 else W
+            y0, y1 = i * h_step, (i + 1) * h_step if i < grid_size - 1 else H
+            patch = input[y0:y1, x0:x1, :]
+
+            kernel = kernels[i * grid_size + j]
+            patch_t = torch.from_numpy(patch).type(torch.FloatTensor).to(device).unsqueeze(0).permute(3, 0, 1, 2)
+            patch_t = F.pad(patch_t, pad=(kernel.shape[0] // 2,) * 4, mode='circular')
+            kernel_t = torch.from_numpy(kernel).type(torch.FloatTensor).to(device).unsqueeze(0).unsqueeze(0)
+
+            out = F.conv2d(patch_t, kernel_t)
+            out = out.permute(2, 3, 0, 1).squeeze(3).cpu().numpy()
+            out = out[::scale_factor[0], ::scale_factor[1], :]
+            row_patches.append(out)
+        outputs.append(np.concatenate(row_patches, axis=1))
+
+    output = np.concatenate(outputs, axis=0)
+    output += np.random.normal(0, np.random.uniform(0, noise_im), output.shape)
     return output
 
 
 def modcrop(img_in, scale):
-    # img_in: Numpy, HWC or HW
     img = np.copy(img_in)
     if img.ndim == 3:
         H, W, C = img.shape
@@ -122,76 +119,85 @@ def modcrop(img_in, scale):
     return img
 
 
-def generate_dataset(images_path, out_path_im, out_path_ker, k_size, scale_factor, min_var, max_var, noise_ker,
-                     noise_im, kernelgan_x4=False):
+def generate_dataset(images_path, out_path_im, out_path_ker, k_size, scale_factor,
+                     min_var, max_var, noise_ker, noise_im, kernelgan_x4=False, regionwise=False, grid_size=2):
     os.makedirs(out_path_im, exist_ok=True)
     os.makedirs(out_path_ker, exist_ok=True)
 
-    # Load images, downscale using kernels and save
     files_source = glob.glob(images_path)
     files_source.sort()
     for i, path in enumerate(files_source):
         print(path)
-
         im = np.array(Image.open(path).convert('RGB')).astype(np.float32) / 255.
-
         im = modcrop(im, scale_factor[0])
 
-        if kernelgan_x4:
-            # As in original kernelgan, for x4, we use analytic kernel calculated from x2.
-            kernel = gen_kernel_random(k_size, 2, min_var, max_var, noise_ker)
-            kernel = analytic_kernel(kernel)
-            kernel = kernel_shift(kernel, 4)
+        if regionwise:
+            num_regions = grid_size * grid_size
+            kernels = [gen_kernel_random(k_size, scale_factor, min_var, max_var, noise_ker) for _ in range(num_regions)]
+            lr = degradation_regionwise(im, kernels, scale_factor, noise_im,
+                                        grid_size=grid_size,
+                                        device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+            for idx, ker in enumerate(kernels):
+                savemat('%s/%s_part%d.mat' % (out_path_ker, os.path.splitext(os.path.basename(path))[0], idx),
+                        {'Kernel': ker})
+                plot_kernel(ker, '%s/%s_part%d.png' % (out_path_ker, os.path.splitext(os.path.basename(path))[0], idx))
         else:
-            kernel = gen_kernel_random(k_size, scale_factor, min_var, max_var, noise_ker)
+            if kernelgan_x4:
+                kernel = gen_kernel_random(k_size, 2, min_var, max_var, noise_ker)
+                kernel = analytic_kernel(kernel)
+                kernel = kernel_shift(kernel, 4)
+            else:
+                kernel = gen_kernel_random(k_size, scale_factor, min_var, max_var, noise_ker)
 
-        lr = degradation(im, kernel, scale_factor, noise_im,
-                         device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+            lr = degradation(im, kernel, scale_factor, noise_im,
+                             device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 
-        # savemat('%s/%s.mat' % (out_path_ker, os.path.splitext(os.path.basename(path))[0]), {'Kernel': kernel})
-        savemat('%s/%s.mat' % (out_path_ker, os.path.splitext(os.path.basename(path))[0]), {'Kernel': kernel})
+            savemat('%s/%s.mat' % (out_path_ker, os.path.splitext(os.path.basename(path))[0]), {'Kernel': kernel})
+            plot_kernel(kernel, '%s/%s.png' % (out_path_ker, os.path.splitext(os.path.basename(path))[0]))
+
         plt.imsave('%s/%s.png' % (out_path_im, os.path.splitext(os.path.basename(path))[0]),
                    np.clip(lr, 0, 1), vmin=0, vmax=1)
 
-        plot_kernel(kernel, '%s/%s.png' % (out_path_ker, os.path.splitext(os.path.basename(path))[0]))
 
 def plot_kernel(gt_k_np, savepath):
     plt.clf()
     f, ax = plt.subplots(1, 1, figsize=(6, 4), squeeze=False)
     im = ax[0, 0].imshow(gt_k_np, vmin=0, vmax=gt_k_np.max())
     plt.colorbar(im, ax=ax[0, 0])
-    # im = ax[0, 1].imshow(out_k_np, vmin=0, vmax=out_k_np.max())
-    # plt.colorbar(im, ax=ax[0, 1])
-    # ax[0, 0].set_title('GT')
-    # ax[0, 1].set_title('PSNR: {:.2f}'.format(calculate_psnr(gt_k_np, out_k_np, True)))
-
     plt.savefig(savepath)
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='DIPDKP',
-                        help='DIPDKP, generate data blurred by anisotropic Gaussian kernel. '
-                             'Note that kernelgan uses x4 analytical kernel calculated from x2.')
+                        help='DIPDKP, generate data blurred by anisotropic Gaussian kernel.')
     parser.add_argument('--sf', type=int, default=4, help='scale factor: 2, 3, 4, 8')
-    parser.add_argument('--dataset', type=str, default='Set5', help='dataset: Set5, Set14, BSD100, Urban100, DIV2K')
-    parser.add_argument('--noise_ker', type=float, default=0, help='noise on kernel, e.g. 0.4')
-    parser.add_argument('--noise_im', type=float, default=0, help='noise on LR image, e.g. 10/255=0.039')
+    parser.add_argument('--dataset', type=str, default='Set5',
+                        help='dataset: Set5, Set14, BSD100, Urban100, DIV2K')
+    parser.add_argument('--noise_ker', type=float, default=0, help='noise on kernel')
+    parser.add_argument('--noise_im', type=float, default=0, help='noise on LR image')
+    parser.add_argument('--regionwise', action='store_true',
+                        help='Apply different blur kernels to grid regions of the image')
+    parser.add_argument('--grid_size', type=int, default=2,
+                        help='Grid size for regionwise blur (default=2 means 2x2 grid)')
     opt = parser.parse_args()
 
-    images_path = 'datasets/{}/HR/*.png'.format(opt.dataset)
-    out_path_im = 'datasets/{}/{}_lr_x{}'.format(opt.dataset, opt.model, opt.sf)
-    out_path_ker = 'datasets/{}/{}_gt_k_x{}'.format(opt.dataset, opt.model, opt.sf)
+    work_path = os.path.dirname(__file__)
+
+    images_path = '{}/datasets/{}/HR/*.png'.format(work_path, opt.dataset)
+    out_path_im = '{}/datasets/{}/{}_lr_x{}'.format(work_path, opt.dataset, opt.model, opt.sf)
+    out_path_ker = '{}/datasets/{}/{}_gt_k_x{}'.format(work_path, opt.dataset, opt.model, opt.sf)
 
     if opt.model == 'DIPDKP':
         min_var = 0.175 * opt.sf
         max_var = min(2.5 * opt.sf, 10)
-
-        k_size = np.array([min(opt.sf * 4 + 3, 21), min(opt.sf * 4 + 3, 21)]) # 11x11, 15x15, 19x19, 21x21 for x2, x3, x4, x8
-        generate_dataset(images_path, out_path_im, out_path_ker, k_size, np.array([opt.sf, opt.sf]), min_var, max_var,
-                         opt.noise_ker, opt.noise_im)
-
+        k_size = np.array([min(opt.sf * 4 + 3, 21), min(opt.sf * 4 + 3, 21)])
+        generate_dataset(images_path, out_path_im, out_path_ker, k_size, np.array([opt.sf, opt.sf]),
+                         min_var, max_var, opt.noise_ker, opt.noise_im,
+                         regionwise=opt.regionwise, grid_size=opt.grid_size)
     else:
         raise NotImplementedError
+
 
 if __name__ == '__main__':
     seed = 1
@@ -202,4 +208,3 @@ if __name__ == '__main__':
 
     main()
     sys.exit()
-
